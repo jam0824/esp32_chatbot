@@ -8,14 +8,16 @@ from openai import OpenAI
 SAMPLE_RATE   = 16000
 FRAME_BYTES   = 640                 # 20ms (16k * 2B * 0.02s)
 SILENCE_MS    = 600
-RMS_THRESH    = 500                 # ← 環境がうるさいなら 800〜1200 に上げる or 下のログを見て調整
-FINAL_WAIT_MS = 500                 # ★ FINAL確定後、この時間静かなら返答トリガ
+RMS_THRESH    = 500                 # 環境に合わせて調整
+FINAL_WAIT_MS = 500                 # フォールバック用
 LANG          = "ja-JP"
+SEGMENT_SILENCE_MS = 2000           # 2秒以上の無音でSTTストリームを再生成
+STREAM_MAX_SEC      = 55            # 55秒ごとにロールオーバー
 
 app = FastAPI()
 speech_client = speech.SpeechClient()
 tts_client    = texttospeech.TextToSpeechClient()
-oa            = OpenAI()  # OPENAI_API_KEY
+oa            = OpenAI()  # OPENAI_API_KEY を環境変数で設定
 
 def rms_int16(pcm: bytes) -> float:
     import array
@@ -31,10 +33,11 @@ def synth_tts_16k_linear16(text: str) -> bytes:
         audio_config=texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
             sample_rate_hertz=SAMPLE_RATE,
-            volume_gain_db=8.0,
+            volume_gain_db=8.0,  # 小さければ 12.0 まで上げてOK
         )
     )
     wav = tts_client.synthesize_speech(request=req).audio_content
+    # WAVヘッダが付く環境もあるので簡易剥がし
     if len(wav) >= 12 and wav[:4]==b'RIFF' and wav[8:12]==b'WAVE':
         i = 12
         while i+8 <= len(wav):
@@ -44,7 +47,6 @@ def synth_tts_16k_linear16(text: str) -> bytes:
     return wav
 
 def llm_reply_ja(user_text: str) -> str:
-    # コンソールに LLM 入出力を必ず出す（★）
     print(f"[LLM-REQ] {user_text}")
     r = oa.responses.create(
         model="gpt-4.1-nano",
@@ -58,11 +60,10 @@ def llm_reply_ja(user_text: str) -> str:
         out = r.output_text.strip()
     except Exception:
         out = r.output[0].content[0].text.strip()
-    print(f"[LLM-RES] {out}")  # ★ 出力をログ
+    print(f"[LLM-RES] {out}")
     return out
 
-def google_streaming_worker(audio_q: "queue.Queue[bytes|None]",
-                            result_q: "queue.Queue[tuple[str,float]]"):  # ★ (text, timestamp)
+def google_streaming_worker(audio_q, result_q):
     recog_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=SAMPLE_RATE,
@@ -74,6 +75,7 @@ def google_streaming_worker(audio_q: "queue.Queue[bytes|None]",
         config=recog_config, interim_results=True, single_utterance=False
     )
 
+    # 最初の1フレームを受け取ってから開始（タイムアウト回避）
     first = audio_q.get()
     if first is None:
         return
@@ -92,18 +94,19 @@ def google_streaming_worker(audio_q: "queue.Queue[bytes|None]",
                 alt = res.alternatives[0].transcript
                 if res.is_final:
                     print(f"[FINAL] {alt}")
-                    result_q.put((alt, time.time()))  # ★ FINALの時刻も渡す
+                    result_q.put((alt, time.time()))
                 else:
                     print(f"[INTERIM] {alt}")
     except Exception as e:
         print("[stt stream error]", e)
 
 async def send_pcm_frames(ws: WebSocket, pcm16: bytes):
+    # 20msごとに分割してBase64テキストで送る
     for i in range(0, len(pcm16), FRAME_BYTES):
         chunk = pcm16[i:i+FRAME_BYTES]
         b64 = base64.b64encode(chunk).decode("ascii")
         await ws.send_text(b64)
-        await asyncio.sleep(0)  # イベントループに譲る
+        await asyncio.sleep(0)
 
 @app.get("/", response_class=PlainTextResponse)
 def hello():
@@ -114,16 +117,29 @@ async def ws_chat(ws: WebSocket):
     await ws.accept()
     print("[WS] connected")
 
-    audio_q: "queue.Queue[bytes|None]" = queue.Queue()
-    result_q: "queue.Queue[tuple[str,float]]" = queue.Queue()
-    worker = threading.Thread(target=google_streaming_worker, args=(audio_q, result_q), daemon=True)
-    worker.start()
+    audio_q = None
+    result_q = None
+    worker = None
+    worker_start = 0.0
 
+    def start_worker():
+        nonlocal audio_q, result_q, worker, worker_start
+        audio_q = queue.Queue()
+        result_q = queue.Queue()
+        worker = threading.Thread(target=google_streaming_worker, args=(audio_q, result_q), daemon=True)
+        worker.start()
+        worker_start = time.time()
+        print("[STT] worker started")
+
+    start_worker()
+
+    # 状態
     silent_ms = 0
     speaking  = False
-    pending_texts: list[str] = []
-    last_final_ts: float | None = None
+    pending_texts = []
+    last_final_ts = None
 
+    # 診断
     rx_frames = 0
     t0 = time.time()
 
@@ -149,7 +165,7 @@ async def ws_chat(ws: WebSocket):
 
             pcm = base64.b64decode(msg)
 
-            # STTへ供給：TTS中は無音を入れてタイムアウト回避
+            # STTへ供給：TTS中はゼロを入れてタイムアウト回避
             audio_q.put(pcm if not speaking else b"\x00" * FRAME_BYTES)
 
             # 無音検出（診断ログ）
@@ -157,6 +173,34 @@ async def ws_chat(ws: WebSocket):
             silent_ms = silent_ms + 20 if r < RMS_THRESH else 0
             if rx_frames % 25 == 0:
                 print(f"[RMS] {r:.0f}  [silence={silent_ms}ms]  thresh={RMS_THRESH}")
+
+            # STTワーカー自己回復
+            if worker is not None and not worker.is_alive():
+                print("[STT] worker died; restarting")
+                try: audio_q.put(None)
+                except: pass
+                with contextlib.suppress(Exception):
+                    worker.join(timeout=2)
+                start_worker()
+
+            # 長無音でセグメント切替（TTS中でなければ）
+            if not speaking and silent_ms >= SEGMENT_SILENCE_MS:
+                print(f"[STT] segment: {SEGMENT_SILENCE_MS}ms silence -> restart stream")
+                try: audio_q.put(None)
+                except: pass
+                with contextlib.suppress(Exception):
+                    worker.join(timeout=2)
+                start_worker()
+                silent_ms = 0
+
+            # 最大稼働時間でロールオーバー
+            if time.time() - worker_start >= STREAM_MAX_SEC:
+                print(f"[STT] segment: time rollover {STREAM_MAX_SEC}s -> restart stream")
+                try: audio_q.put(None)
+                except: pass
+                with contextlib.suppress(Exception):
+                    worker.join(timeout=2)
+                start_worker()
 
             # STTから確定テキストを回収（FINAL受信＝即トリガ）
             got_new_final = False
