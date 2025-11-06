@@ -5,16 +5,30 @@ from google.cloud import speech_v1 as speech
 from google.cloud import texttospeech
 from openai import OpenAI
 from starlette.websockets import WebSocketDisconnect, WebSocketState
+import webrtcvad
+from collections import deque
 
 # ===== Config =====
 SAMPLE_RATE   = 16000
 FRAME_BYTES   = 640                 # 20ms (16k * 2B * 0.02s)
-SILENCE_MS    = 600
-RMS_THRESH    = 500                 # ノイズが強いなら 800〜1200
-FINAL_WAIT_MS = 500                 # フォールバック用（通常はFINAL即応答）
-LANG          = "en-US"             # 英語STT/TTS
-SEGMENT_SILENCE_MS = 2000           # 2秒無音でSTTストリーム再生成
-STREAM_MAX_SEC      = 55            # 55秒ごとにロールオーバー
+
+# 返答トリガ & ロールオーバー
+SILENCE_MS          = 600
+FINAL_WAIT_MS       = 500
+STREAM_MAX_SEC      = 55            # 55秒ごとに保守的に張り直し（“聞く”状態の時だけ）
+
+# --- WebRTC VAD パラメータ ---
+# aggressiveness: 0(緩)〜3(厳)。数値が大きいほどノイズでも無音扱いになりやすい
+VAD_AGGRESSIVENESS  = int(os.getenv("VAD_AGGR", "2"))
+# 発話開始とみなすのに必要な連続スピーチ時間
+VAD_START_SPEECH_MS = 100          # 100ms（= 5フレーム）連続で is_speech True
+# 発話終了（無音）とみなしSTT停止するまでの連続無音時間
+VAD_STOP_SILENCE_MS = 600          # 600ms（= 30フレーム）
+# 発話の頭切れ防止のため、STT開始時に過去フレームを先送りするプリロール
+VAD_PREBUFFER_MS    = 200          # 200ms（= 10フレーム）
+
+# STT/TTS
+LANG                = "en-US"
 DEFAULT_TTS_VOICE   = os.getenv("TTS_VOICE", "en-US-Neural2-F")  # 例: en-US-Studio-O, en-US-Wavenet-D
 
 app = FastAPI()
@@ -34,15 +48,12 @@ def synth_tts_16k_linear16(text: str) -> bytes:
     audio_cfg = texttospeech.AudioConfig(
         audio_encoding=texttospeech.AudioEncoding.LINEAR16,
         sample_rate_hertz=SAMPLE_RATE,
-        speaking_rate=1.05,                 # 少し速め
-        pitch=-2.0,                         # 少し低め
-        volume_gain_db=10.0,                # 8〜12dBで調整
+        speaking_rate=1.05,
+        pitch=-2.0,
+        volume_gain_db=10.0,
         effects_profile_id=["small-bluetooth-speaker-class-device"],
     )
-    voice = texttospeech.VoiceSelectionParams(
-        language_code=LANG,
-        name=DEFAULT_TTS_VOICE
-    )
+    voice = texttospeech.VoiceSelectionParams(language_code=LANG, name=DEFAULT_TTS_VOICE)
     req = texttospeech.SynthesizeSpeechRequest(
         input=texttospeech.SynthesisInput(text=text),
         voice=voice,
@@ -82,7 +93,6 @@ def google_streaming_worker(audio_q, result_q):
         sample_rate_hertz=SAMPLE_RATE,
         language_code=LANG,
         enable_automatic_punctuation=True,
-        # 互換性重視：環境によって latest_short が使えないことがあるため default に
         model="default",
     )
     stream_config = speech.StreamingRecognitionConfig(
@@ -97,8 +107,7 @@ def google_streaming_worker(audio_q, result_q):
         return
 
     def req_iter():
-        # ★ ここでは "audio_content" だけを送る（streaming_config は送らない）
-        #   → streaming_recognize(config=stream_config, requests=req_iter()) と組み合わせる
+        # ★ requests側は audio のみ（configは関数引数で指定）
         yield speech.StreamingRecognizeRequest(audio_content=first)
         while True:
             chunk = audio_q.get()
@@ -108,11 +117,10 @@ def google_streaming_worker(audio_q, result_q):
 
     try:
         print("[STT] streaming_recognize started (config param + audio-only requests)")
-        # ★ config を引数で渡し、requests 側は audio のみ
         for resp in speech_client.streaming_recognize(config=stream_config, requests=req_iter()):
             for res in resp.results:
                 alt = res.alternatives[0].transcript
-                # ★ 空文字のINTERIM/FINALは完全スキップ（ログにも出さない）
+                # 空INTERIM/FINALは完全スキップ
                 if not alt or not alt.strip():
                     continue
                 if res.is_final:
@@ -134,7 +142,7 @@ async def send_pcm_frames(ws: WebSocket, pcm16: bytes):
 
 @app.get("/", response_class=PlainTextResponse)
 def hello():
-    return "Realtime voice chatbot WS server (en-US)."
+    return "Realtime voice chatbot WS server (en-US, WebRTC VAD-gated)."
 
 # ===== Main WS =====
 @app.websocket("/ws_chat")
@@ -142,13 +150,24 @@ async def ws_chat(ws: WebSocket):
     await ws.accept()
     print("[WS] connected")
 
+    # --- VAD 準備 ---
+    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+    prebuffer_frames = max(1, VAD_PREBUFFER_MS // 20)
+    preroll = deque(maxlen=prebuffer_frames)
+
+    # STT ワーカー管理
     audio_q = None
     result_q = None
-    worker = None
+    worker  = None
     worker_start = 0.0
+
+    def worker_alive() -> bool:
+        return (worker is not None) and worker.is_alive()
 
     def start_worker():
         nonlocal audio_q, result_q, worker, worker_start
+        if worker_alive():
+            return
         audio_q = queue.Queue()
         result_q = queue.Queue()
         worker = threading.Thread(target=google_streaming_worker, args=(audio_q, result_q), daemon=True)
@@ -158,7 +177,7 @@ async def ws_chat(ws: WebSocket):
 
     def stop_worker():
         nonlocal worker
-        if worker is not None and worker.is_alive():
+        if worker_alive():
             try:
                 audio_q.put(None)
             except Exception:
@@ -168,14 +187,15 @@ async def ws_chat(ws: WebSocket):
         worker = None
         print("[STT] worker stopped")
 
-    # 最初は「聞く」状態から開始
+    # 最初はリスニング開始（VADで自動的にON/OFF）
     start_worker()
 
     # 状態
-    silent_ms = 0
-    speaking  = False
-    pending_texts = []
-    last_final_ts = None
+    speaking        = False          # サーバがTTS出力中なら True（この間はVADしても起こさない）
+    pending_texts   = []
+    last_final_ts   = None
+    speech_streak   = 0              # 連続 is_speech=True 時間(ms)
+    silence_streak  = 0              # 連続 is_speech=False 時間(ms)
 
     # 診断
     rx_frames = 0
@@ -185,7 +205,6 @@ async def ws_chat(ws: WebSocket):
         """LLM→TTS→送出（非ブロッキング）。送出が終わったら次ターンのためにSTTを張り直す。"""
         nonlocal speaking
         try:
-            speaking = True
             reply   = await asyncio.to_thread(llm_reply_en, user_text)
             pcm_tts = await asyncio.to_thread(synth_tts_16k_linear16, reply)
             print(f"[TTS] start, bytes={len(pcm_tts)} (~{len(pcm_tts)/FRAME_BYTES*20:.0f}ms)")
@@ -195,20 +214,8 @@ async def ws_chat(ws: WebSocket):
             print("[PIPE error]", e)
         finally:
             speaking = False
-            # ★ 次の発話に備えて “聞く” を再開
+            # TTS終了後、次の発話に備えSTTを起こす（VADに任せたいならここを削ってもよい）
             start_worker()
-
-    # 任意：TTS中の保険（ネット揺らぎ時にゼロを補充）
-    ka_running = True
-    async def stt_keepalive():
-        while ka_running:
-            if speaking and worker is not None and worker.is_alive():
-                try:
-                    audio_q.put(b"\x00" * FRAME_BYTES, block=False)
-                except Exception:
-                    pass
-            await asyncio.sleep(0.1)
-    ka_task = asyncio.create_task(stt_keepalive())
 
     try:
         while True:
@@ -221,33 +228,64 @@ async def ws_chat(ws: WebSocket):
 
             pcm = base64.b64decode(msg)
 
-            # STTへ供給（ワーカーが存在する時だけ）
-            if worker is not None and worker.is_alive():
+            # --- WebRTC VAD 判定（16kHz/16bit/mono/20ms 必須）---
+            speech = False
+            if not speaking:
+                try:
+                    speech = vad.is_speech(pcm, SAMPLE_RATE)
+                except Exception as e:
+                    # 異常なフレーム長等は無音扱いに
+                    speech = False
+
+            # --- VAD 状態更新 ---
+            if speech:
+                speech_streak += 20
+                silence_streak = 0
+            else:
+                silence_streak += 20
+                speech_streak = 0
+
+            # --- speaking 中の扱い：回り込み防止のため何もしない ---
+            if speaking:
+                # TTSの音がマイクに回り込んでもVADで起こさない
+                preroll.clear()
+                continue
+
+            # --- リスニング時のVADゲート処理 ---
+            if worker_alive():
+                # STT稼働中：とりあえず連続性のためフレームは送る
                 audio_q.put(pcm)
 
-            # 無音診断（ログ）
-            r = rms_int16(pcm)
-            silent_ms = silent_ms + 20 if r < RMS_THRESH else 0
-            if rx_frames % 25 == 0:
-                print(f"[RMS] {r:.0f}  [silence={silent_ms}ms]  thresh={RMS_THRESH}")
+                # 無音が続けば停止
+                if silence_streak >= VAD_STOP_SILENCE_MS:
+                    print(f"[VAD] silence >= {VAD_STOP_SILENCE_MS}ms -> stop STT")
+                    stop_worker()
+                    preroll.clear()  # 次の起動に備えプリロールはクリア
+            else:
+                # STT停止中：プリロールに溜めつつ、一定の連続スピーチで起動
+                preroll.append(pcm)
+                if speech_streak >= VAD_START_SPEECH_MS:
+                    print(f"[VAD] speech >= {VAD_START_SPEECH_MS}ms -> start STT (with {len(preroll)} preroll frames)")
+                    start_worker()
+                    # 起動直後は最初のフレーム待ちなので、プリロールを一括供給
+                    try:
+                        while preroll:
+                            audio_q.put(preroll.popleft())
+                    except Exception:
+                        preroll.clear()
+                    # 以降は通常どおり供給される
 
-            # ワーカー死活監視（異常時は即再起動）
-            if worker is not None and not worker.is_alive() and not speaking:
-                print("[STT] worker died; restarting")
-                start_worker()
-                silent_ms = 0
-
-            # STTから確定テキストを回収（★空は捨てる）
+            # --- STTから確定テキストを回収（空は捨てる） ---
             got_new_final = False
-            if worker is not None:
+            if worker_alive():
                 while not result_q.empty():
                     txt, ts = result_q.get_nowait()
-                    if txt and txt.strip():   # ★ 空FINALは無視
+                    if txt and txt.strip():
                         pending_texts.append(txt)
                         last_final_ts = ts
                         got_new_final = True
 
-            # 返答トリガ（FINAL直後優先）
+            # --- 返答トリガ（FINAL直後優先） ---
             trigger = False
             trig_reason = ""
             now = time.time()
@@ -255,52 +293,42 @@ async def ws_chat(ws: WebSocket):
                 if got_new_final:
                     trigger = True
                     trig_reason = "final-immediate"
-                elif silent_ms >= SILENCE_MS:
+                elif silence_streak >= SILENCE_MS:
                     trigger = True
                     trig_reason = f"silence {SILENCE_MS}ms"
                 elif last_final_ts is not None and (now - last_final_ts) * 1000 >= FINAL_WAIT_MS:
                     trigger = True
                     trig_reason = f"final-wait {FINAL_WAIT_MS}ms"
 
-            if trigger and not speaking:
+            if trigger:
                 user_text = " ".join(pending_texts).strip()
                 pending_texts.clear()
                 print(f"[TRIGGER] {trig_reason}  user='{user_text}'")
 
-                # 話す前にSTTを止める（タイムアウト/回り込み回避）
+                # 話す前にSTTを明示停止
                 stop_worker()
+                preroll.clear()
 
                 if user_text:
+                    speaking = True
                     asyncio.create_task(build_and_speak(user_text))
-                silent_ms = 0
 
-            # “聞く”状態のときだけロールオーバー
-            if worker is not None and worker.is_alive() and not speaking:
-                if silent_ms >= SEGMENT_SILENCE_MS:
-                    print(f"[STT] segment: {SEGMENT_SILENCE_MS}ms silence -> restart stream")
-                    stop_worker()
-                    start_worker()
-                    silent_ms = 0
-                if time.time() - worker_start >= STREAM_MAX_SEC:
-                    print(f"[STT] segment: time rollover {STREAM_MAX_SEC}s -> restart stream")
-                    stop_worker()
-                    start_worker()
+                # カウンタ類リセット
+                speech_streak  = 0
+                silence_streak = 0
+
+            # --- “聞く”状態の時間ロールオーバー ---
+            if worker_alive() and (time.time() - worker_start >= STREAM_MAX_SEC):
+                print(f"[STT] segment: time rollover {STREAM_MAX_SEC}s -> restart stream")
+                stop_worker()
+                start_worker()
 
     except WebSocketDisconnect as e:
-        # クライアント側が切断（ESP32リセット等）→正常系として扱う
         print(f"[WS disconnect] code={getattr(e, 'code', None)} reason={getattr(e, 'reason', '')}")
     except Exception as e:
-        # その他の例外はログ
         print("[WS error]", e)
     finally:
-        # keepalive停止
-        ka_running = False
-        with contextlib.suppress(Exception):
-            ka_task.cancel()
-
         stop_worker()
-
-        # すでに閉じていれば close しない（ASGI二重close回避）
         if getattr(ws, "application_state", None) != WebSocketState.DISCONNECTED:
             with contextlib.suppress(Exception):
                 await ws.close()
