@@ -4,6 +4,7 @@ import asyncio, base64, math, threading, queue, contextlib, time, os
 from google.cloud import speech_v1 as speech
 from google.cloud import texttospeech
 from openai import OpenAI
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 # ===== Config =====
 SAMPLE_RATE   = 16000
@@ -111,6 +112,9 @@ def google_streaming_worker(audio_q, result_q):
         for resp in speech_client.streaming_recognize(config=stream_config, requests=req_iter()):
             for res in resp.results:
                 alt = res.alternatives[0].transcript
+                # ★ 空文字のINTERIM/FINALは完全スキップ（ログにも出さない）
+                if not alt or not alt.strip():
+                    continue
                 if res.is_final:
                     print(f"[FINAL] {alt}")
                     result_q.put((alt, time.time()))
@@ -217,7 +221,7 @@ async def ws_chat(ws: WebSocket):
 
             pcm = base64.b64decode(msg)
 
-            # ★ STTへ供給（ワーカーが存在する時だけ）
+            # STTへ供給（ワーカーが存在する時だけ）
             if worker is not None and worker.is_alive():
                 audio_q.put(pcm)
 
@@ -233,16 +237,17 @@ async def ws_chat(ws: WebSocket):
                 start_worker()
                 silent_ms = 0
 
-            # STTから確定テキストを回収（FINAL受信＝即トリガ）
+            # STTから確定テキストを回収（★空は捨てる）
             got_new_final = False
             if worker is not None:
                 while not result_q.empty():
                     txt, ts = result_q.get_nowait()
-                    pending_texts.append(txt)
-                    last_final_ts = ts
-                    got_new_final = True
+                    if txt and txt.strip():   # ★ 空FINALは無視
+                        pending_texts.append(txt)
+                        last_final_ts = ts
+                        got_new_final = True
 
-            # ★ 返答トリガ（FINAL直後：ここで“聞く”を一旦止める）
+            # 返答トリガ（FINAL直後優先）
             trigger = False
             trig_reason = ""
             now = time.time()
@@ -250,7 +255,6 @@ async def ws_chat(ws: WebSocket):
                 if got_new_final:
                     trigger = True
                     trig_reason = "final-immediate"
-                # フォールバック（念のため）
                 elif silent_ms >= SILENCE_MS:
                     trigger = True
                     trig_reason = f"silence {SILENCE_MS}ms"
@@ -263,28 +267,30 @@ async def ws_chat(ws: WebSocket):
                 pending_texts.clear()
                 print(f"[TRIGGER] {trig_reason}  user='{user_text}'")
 
-                # ★ 「話す」ターンに入る前に STT を明示的に停止（タイムアウト回避）
+                # 話す前にSTTを止める（タイムアウト/回り込み回避）
                 stop_worker()
 
                 if user_text:
                     asyncio.create_task(build_and_speak(user_text))
                 silent_ms = 0
 
-            # さらに保険：長無音や時間でのロールオーバー（“聞く”状態の時のみ）
+            # “聞く”状態のときだけロールオーバー
             if worker is not None and worker.is_alive() and not speaking:
-                # 長無音
                 if silent_ms >= SEGMENT_SILENCE_MS:
                     print(f"[STT] segment: {SEGMENT_SILENCE_MS}ms silence -> restart stream")
                     stop_worker()
                     start_worker()
                     silent_ms = 0
-                # 時間ロールオーバー
                 if time.time() - worker_start >= STREAM_MAX_SEC:
                     print(f"[STT] segment: time rollover {STREAM_MAX_SEC}s -> restart stream")
                     stop_worker()
                     start_worker()
 
+    except WebSocketDisconnect as e:
+        # クライアント側が切断（ESP32リセット等）→正常系として扱う
+        print(f"[WS disconnect] code={getattr(e, 'code', None)} reason={getattr(e, 'reason', '')}")
     except Exception as e:
+        # その他の例外はログ
         print("[WS error]", e)
     finally:
         # keepalive停止
@@ -293,5 +299,9 @@ async def ws_chat(ws: WebSocket):
             ka_task.cancel()
 
         stop_worker()
-        await ws.close()
+
+        # すでに閉じていれば close しない（ASGI二重close回避）
+        if getattr(ws, "application_state", None) != WebSocketState.DISCONNECTED:
+            with contextlib.suppress(Exception):
+                await ws.close()
         print("[WS] disconnected")
