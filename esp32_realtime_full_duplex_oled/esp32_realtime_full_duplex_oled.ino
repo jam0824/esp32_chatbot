@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <ArduinoWebsockets.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -12,6 +13,11 @@ using namespace websockets;
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 #define OLED_ADDR     0x3C   // 必要なら 0x3D に
+#define OLED_SCL 22
+#define OLED_SDA 21
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+RoboEyes<Adafruit_SSD1306> eyes(display);
 
 // ===== WiFi / WS =====
 const char* WIFI_SSID = "TP-Link_C4D5";
@@ -111,6 +117,21 @@ void onMessage(WebsocketsMessage msg) {
   }
 }
 
+void start_oled(){
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)){
+    Serial.println("SSD1306 allocation failed.");
+    for(;;);
+  }
+  display.clearDisplay();
+  display.display();
+
+  eyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 60);
+  eyes.setDisplayColors(0, 1);
+  eyes.setAutoblinker(true,3,1);
+  eyes.setMood(DEFAULT);
+}
+
 void setup() {
   Serial.begin(115200);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -121,6 +142,8 @@ void setup() {
   ws.onMessage(onMessage);
   ws.onEvent([](WebsocketsEvent ev, String){ if (ev==WebsocketsEvent::ConnectionOpened) Serial.println("[WS] opened"); });
   ws.connect(WS_URL);
+
+  start_oled();
 }
 
 void loop() {
@@ -132,4 +155,5 @@ void loop() {
     send_frame_base64((const uint8_t*)pcm16_buf, FRAME_BYTES_16);
   }
   ws.poll();
+  eyes.update();
 }
