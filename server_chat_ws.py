@@ -30,11 +30,13 @@ VAD_PREBUFFER_MS    = 200          # 200ms（= 10フレーム）
 # STT/TTS
 LANG                = "en-US"
 DEFAULT_TTS_VOICE   = os.getenv("TTS_VOICE", "en-US-Neural2-F")  # 例: en-US-Studio-O, en-US-Wavenet-D
+SYSTEM_PROMPT       = "You are a concise, friendly English voice assistant. Keep replies short and natural for TTS."
 
 app = FastAPI()
 speech_client = speech.SpeechClient()
 tts_client    = texttospeech.TextToSpeechClient()
 oa            = OpenAI()  # OPENAI_API_KEY を環境変数に
+history = ""
 
 # ===== Utils =====
 def rms_int16(pcm: bytes) -> float:
@@ -70,11 +72,14 @@ def synth_tts_16k_linear16(text: str) -> bytes:
     return wav
 
 def llm_reply_en(user_text: str) -> str:
+    global history
     print(f"[LLM-REQ] {user_text}")
+    history = history + "User: " + user_text + "\n"
+    system_content = SYSTEM_PROMPT + " chat history: " + history
     r = oa.responses.create(
         model="gpt-4.1-nano",
         input=[
-            {"role":"system","content":"You are a concise, friendly English voice assistant. Keep replies short and natural for TTS."},
+            {"role":"system","content":system_content},
             {"role":"user","content":user_text}
         ],
         max_output_tokens=120
@@ -84,6 +89,8 @@ def llm_reply_en(user_text: str) -> str:
     except Exception:
         out = r.output[0].content[0].text.strip()
     print(f"[LLM-RES] {out}")
+    history = history + "Assistant: " + out + "\n"
+    print(f"[LLM-HIST] {history}")
     return out
 
 # ===== STT Worker (configパラメータ + audio-only requests) =====
