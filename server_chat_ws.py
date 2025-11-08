@@ -19,7 +19,7 @@ STREAM_MAX_SEC      = 55            # 55秒ごとに保守的に張り直し（�
 
 # --- WebRTC VAD パラメータ ---
 # aggressiveness: 0(緩)〜3(厳)。数値が大きいほどノイズでも無音扱いになりやすい
-VAD_AGGRESSIVENESS  = int(os.getenv("VAD_AGGR", "2"))
+VAD_AGGRESSIVENESS  = int(os.getenv("VAD_AGGR", "3"))
 # 発話開始とみなすのに必要な連続スピーチ時間
 VAD_START_SPEECH_MS = 100          # 100ms（= 5フレーム）連続で is_speech True
 # 発話終了（無音）とみなしSTT停止するまでの連続無音時間

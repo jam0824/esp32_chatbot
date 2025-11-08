@@ -4,7 +4,8 @@
 #include <ArduinoWebsockets.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <FluxGarage_RoboEyes.h>
+#include <FluxGarage_RoboEyes.h> //https://github.com/FluxGarage/RoboEyes
+#include "esp_system.h"
 #include "driver/i2s.h"
 #include "mbedtls/base64.h"
 using namespace websockets;
@@ -15,9 +16,14 @@ using namespace websockets;
 #define OLED_ADDR     0x3C   // 必要なら 0x3D に
 #define OLED_SCL 22
 #define OLED_SDA 21
+#define OLED_FPS 30
+constexpr int FACE_INTERVAL_FRAMES = 100;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 RoboEyes<Adafruit_SSD1306> eyes(display);
+int count = 0;
+static volatile bool is_speak_face = false;
+static uint32_t last_tts_ms = 0;
 
 // ===== WiFi / WS =====
 const char* WIFI_SSID = "TP-Link_C4D5";
@@ -101,6 +107,13 @@ void send_frame_base64(const uint8_t* pcm16, size_t len) {
 void onMessage(WebsocketsMessage msg) {
   if (!msg.isText()) return;
   String b64 = msg.data();
+  if(!is_speak_face){
+    is_speak_face = true;
+    eyes.setMood(HAPPY);
+    eyes.update();
+    Serial.println("\nChange Speaking Face.");
+    last_tts_ms = millis();
+  }
   // Base64 -> 16bit PCM
   size_t out_len = (b64.length() * 3) / 4 + 8;
   std::unique_ptr<uint8_t[]> buf(new uint8_t[out_len]);
@@ -126,7 +139,7 @@ void start_oled(){
   display.clearDisplay();
   display.display();
 
-  eyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 60);
+  eyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_FPS);
   eyes.setDisplayColors(0, 1);
   eyes.setAutoblinker(true,3,1);
   eyes.setMood(DEFAULT);
@@ -134,6 +147,7 @@ void start_oled(){
 
 void setup() {
   Serial.begin(115200);
+  randomSeed(esp_random());
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) { delay(200); Serial.print("."); }
   Serial.println("\nWiFi OK");
@@ -146,6 +160,29 @@ void setup() {
   start_oled();
 }
 
+void change_face(int& face_count){
+  face_count++;
+  if(face_count == FACE_INTERVAL_FRAMES){
+    Serial.println("\nChange Face.");
+    int r = random(4);
+    switch(r){
+      case 0:
+        eyes.setMood(DEFAULT);
+        break;
+      case 1:
+        eyes.setMood(HAPPY);
+        break;
+      case 2:
+        eyes.setMood(ANGRY);
+        break;
+      case 3:
+        eyes.setMood(TIRED);
+        break;
+    }
+    face_count = 0;
+  }
+}
+
 void loop() {
   // 20ms分のマイク読み取り（32bitフレーム）
   size_t bytes_read = 0;
@@ -155,5 +192,11 @@ void loop() {
     send_frame_base64((const uint8_t*)pcm16_buf, FRAME_BYTES_16);
   }
   ws.poll();
+  // change_face(count);
   eyes.update();
+  if (is_speak_face && (millis() - last_tts_ms) > 5000) {
+    is_speak_face = false;
+    eyes.setMood(DEFAULT);
+    Serial.println("\nChange Default Face.");
+  }
 }
