@@ -16,6 +16,7 @@ FRAME_BYTES   = 640                 # 20ms (16k * 2B * 0.02s)
 SILENCE_MS          = 600
 FINAL_WAIT_MS       = 500
 STREAM_MAX_SEC      = 55            # 55秒ごとに保守的に張り直し（“聞く”状態の時だけ）
+IDLE_STOP_MS        = int(os.getenv("IDLE_STOP_MS", "1200"))  # 受信アイドルでSTT停止するまでの時間(ms)
 
 # --- WebRTC VAD パラメータ ---
 # aggressiveness: 0(緩)〜3(厳)。数値が大きいほどノイズでも無音扱いになりやすい
@@ -30,7 +31,7 @@ VAD_PREBUFFER_MS    = 200          # 200ms（= 10フレーム）
 # STT/TTS
 LANG                = "en-US"
 DEFAULT_TTS_VOICE   = os.getenv("TTS_VOICE", "en-US-Neural2-F")  # 例: en-US-Studio-O, en-US-Wavenet-D
-SYSTEM_PROMPT       = "You are a concise, friendly English voice assistant. Keep replies short and natural for TTS."
+SYSTEM_PROMPT       = "Your name is Chapiko. User name is Matsu. You are a concise, friendly English voice assistant. Keep replies short and natural for TTS."
 
 app = FastAPI()
 speech_client = speech.SpeechClient()
@@ -207,6 +208,7 @@ async def ws_chat(ws: WebSocket):
     # 診断
     rx_frames = 0
     t0 = time.time()
+    last_rx_ts = time.time()
 
     async def build_and_speak(user_text: str):
         """LLM→TTS→送出（非ブロッキング）。送出が終わったら次ターンのためにSTTを張り直す。"""
@@ -226,7 +228,17 @@ async def ws_chat(ws: WebSocket):
 
     try:
         while True:
-            msg = await ws.receive_text()
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=0.5)
+                last_rx_ts = time.time()
+            except asyncio.TimeoutError:
+                # 受信が途切れて一定時間経過したらSTTを停止（Audio Timeout回避）
+                if worker_alive() and (time.time() - last_rx_ts) * 1000 >= IDLE_STOP_MS:
+                    print(f"[STT] idle >= {IDLE_STOP_MS}ms -> stop STT")
+                    stop_worker()
+                    preroll.clear()
+                continue
+
             rx_frames += 1
             if rx_frames % 50 == 0:
                 dt = time.time() - t0
