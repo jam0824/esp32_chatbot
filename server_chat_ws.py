@@ -12,26 +12,26 @@ from collections import deque
 SAMPLE_RATE   = 16000
 FRAME_BYTES   = 640                 # 20ms (16k * 2B * 0.02s)
 
-# 返答トリガ & ロールオーバー
-SILENCE_MS          = 600
-FINAL_WAIT_MS       = 500
-STREAM_MAX_SEC      = 55            # 55秒ごとに保守的に張り直し（“聞く”状態の時だけ）
-IDLE_STOP_MS        = int(os.getenv("IDLE_STOP_MS", "1200"))  # 受信アイドルでSTT停止するまでの時間(ms)
+# 返答トリガ & ロールオーバー（低遅延寄りの既定。環境変数で上書き可）
+SILENCE_MS          = 300
+FINAL_WAIT_MS       = 200
+STREAM_MAX_SEC      = 55   # 55秒ごとに保守的に張り直し（“聞く”状態の時だけ）
+IDLE_STOP_MS        = 1200   # 受信アイドルでSTT停止するまでの時間(ms)
 
 # --- WebRTC VAD パラメータ ---
 # aggressiveness: 0(緩)〜3(厳)。数値が大きいほどノイズでも無音扱いになりやすい
-VAD_AGGRESSIVENESS  = int(os.getenv("VAD_AGGR", "3"))
+VAD_AGGRESSIVENESS  = 3
 # 発話開始とみなすのに必要な連続スピーチ時間
-VAD_START_SPEECH_MS = 100          # 100ms（= 5フレーム）連続で is_speech True
-# 発話終了（無音）とみなしSTT停止するまでの連続無音時間
-VAD_STOP_SILENCE_MS = 600          # 600ms（= 30フレーム）
+VAD_START_SPEECH_MS = 100   # ms
+# 発話終了（無音）とみなしSTT停止するまでの連続無音時間（低遅延寄り）
+VAD_STOP_SILENCE_MS = 400   # ms
 # 発話の頭切れ防止のため、STT開始時に過去フレームを先送りするプリロール
-VAD_PREBUFFER_MS    = 200          # 200ms（= 10フレーム）
+VAD_PREBUFFER_MS    = 200      # ms
 
 # STT/TTS
 LANG                = "en-US"
-DEFAULT_TTS_VOICE   = os.getenv("TTS_VOICE", "en-US-Neural2-F")  # 例: en-US-Studio-O, en-US-Wavenet-D
-SYSTEM_PROMPT       = "Your name is Chapiko. User name is Matsu. You are a concise, friendly English voice assistant. Keep replies short and natural for TTS."
+DEFAULT_TTS_VOICE   = "en-US-Neural2-F"  # 例: en-US-Studio-O, en-US-Wavenet-D
+SYSTEM_PROMPT       = "Your name is Chapiko.You are a concise, friendly English voice assistant. User studies English. You are a teacher.Keep replies short and natural for TTS."
 
 app = FastAPI()
 speech_client = speech.SpeechClient()
@@ -40,6 +40,41 @@ oa            = OpenAI()  # OPENAI_API_KEY を環境変数に
 history = ""
 
 # ===== Utils =====
+def collect_final_results(worker_alive: bool, result_q: queue.Queue, pending: list[str]) -> bool:
+    """STT結果キューから最終テキストをpendingへ追加し、追加があればTrue。"""
+    if not worker_alive:
+        return False
+    added = False
+    while not result_q.empty():
+        try:
+            txt, _ = result_q.get_nowait()
+        except queue.Empty:
+            break
+        if txt and txt.strip():
+            pending.append(txt)
+            added = True
+    return added
+
+
+def should_trigger_reply(
+    pending_texts: list[str],
+    got_new_final: bool,
+    silence_streak: int,
+    last_final_ts: float | None,
+) -> tuple[bool, str]:
+    """LLM 返答を開始するか判定し、トリガ状態と理由を返す。"""
+    if not pending_texts:
+        return False, ""
+
+    now = time.time()
+    if got_new_final:
+        return True, "final-immediate"
+    if silence_streak >= SILENCE_MS:
+        return True, f"silence {SILENCE_MS}ms"
+    if last_final_ts is not None and (now - last_final_ts) * 1000 >= FINAL_WAIT_MS:
+        return True, f"final-wait {FINAL_WAIT_MS}ms"
+    return False, ""
+
 def rms_int16(pcm: bytes) -> float:
     import array
     a = array.array('h'); a.frombytes(pcm)
@@ -173,17 +208,23 @@ async def ws_chat(ws: WebSocket):
         return (worker is not None) and worker.is_alive()
 
     def start_worker():
+        """STT ワーカーを生成・起動（既に動作中なら何もしない）。"""
         nonlocal audio_q, result_q, worker, worker_start
         if worker_alive():
             return
         audio_q = queue.Queue()
         result_q = queue.Queue()
-        worker = threading.Thread(target=google_streaming_worker, args=(audio_q, result_q), daemon=True)
+        worker = threading.Thread(
+            target=google_streaming_worker,
+            args=(audio_q, result_q),
+            daemon=True,
+        )
         worker.start()
         worker_start = time.time()
         print("[STT] worker started")
 
     def stop_worker():
+        """STT ワーカーを停止し、参照をクリアする。"""
         nonlocal worker
         if worker_alive():
             try:
@@ -209,13 +250,18 @@ async def ws_chat(ws: WebSocket):
     rx_frames = 0
     t0 = time.time()
     last_rx_ts = time.time()
+    last_trigger_ts = None
 
     async def build_and_speak(user_text: str):
         """LLM→TTS→送出（非ブロッキング）。送出が終わったら次ターンのためにSTTを張り直す。"""
         nonlocal speaking
+        nonlocal last_trigger_ts
         try:
             reply   = await asyncio.to_thread(llm_reply_en, user_text)
             pcm_tts = await asyncio.to_thread(synth_tts_16k_linear16, reply)
+            if last_trigger_ts is not None:
+                tat = (time.time() - last_trigger_ts) * 1000.0
+                print(f"[TAT] first-audio {tat:.1f} ms (google)")
             print(f"[TTS] start, bytes={len(pcm_tts)} (~{len(pcm_tts)/FRAME_BYTES*20:.0f}ms)")
             await send_pcm_frames(ws, pcm_tts)
             print("[TTS] done")
@@ -295,29 +341,17 @@ async def ws_chat(ws: WebSocket):
                     # 以降は通常どおり供給される
 
             # --- STTから確定テキストを回収（空は捨てる） ---
-            got_new_final = False
-            if worker_alive():
-                while not result_q.empty():
-                    txt, ts = result_q.get_nowait()
-                    if txt and txt.strip():
-                        pending_texts.append(txt)
-                        last_final_ts = ts
-                        got_new_final = True
+            got_new_final = collect_final_results(worker_alive(), result_q, pending_texts)
+            if got_new_final:
+                last_final_ts = time.time()
 
             # --- 返答トリガ（FINAL直後優先） ---
-            trigger = False
-            trig_reason = ""
-            now = time.time()
-            if pending_texts:
-                if got_new_final:
-                    trigger = True
-                    trig_reason = "final-immediate"
-                elif silence_streak >= SILENCE_MS:
-                    trigger = True
-                    trig_reason = f"silence {SILENCE_MS}ms"
-                elif last_final_ts is not None and (now - last_final_ts) * 1000 >= FINAL_WAIT_MS:
-                    trigger = True
-                    trig_reason = f"final-wait {FINAL_WAIT_MS}ms"
+            trigger, trig_reason = should_trigger_reply(
+                pending_texts=pending_texts,
+                got_new_final=got_new_final,
+                silence_streak=silence_streak,
+                last_final_ts=last_final_ts,
+            )
 
             if trigger:
                 user_text = " ".join(pending_texts).strip()
@@ -330,6 +364,7 @@ async def ws_chat(ws: WebSocket):
 
                 if user_text:
                     speaking = True
+                    last_trigger_ts = time.time()
                     asyncio.create_task(build_and_speak(user_text))
 
                 # カウンタ類リセット
