@@ -18,7 +18,7 @@ using namespace websockets;
 #define OLED_SCL 22
 #define OLED_SDA 21
 #define OLED_FPS 30
-constexpr int FACE_INTERVAL_FRAMES = 100;
+constexpr int FACE_INTERVAL_FRAMES = 500;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 RoboEyes<Adafruit_SSD1306> eyes(display);
@@ -138,13 +138,16 @@ void onMessage(WebsocketsMessage msg) {
     return;
   }
   String b64 = payload;
+
   if(!is_speak_face){
+    reset_face();
     is_speak_face = true;
     eyes.setMood(HAPPY);
     eyes.update();
     Serial.println("\nChange Speaking Face.");
     last_tts_ms = millis();
   }
+
   // Base64 -> 16bit PCM
   size_t out_len = (b64.length() * 3) / 4 + 8;
   std::unique_ptr<uint8_t[]> buf(new uint8_t[out_len]);
@@ -219,20 +222,26 @@ void change_face(int& face_count){
     int r = random(4);
     switch(r){
       case 0:
-        eyes.setMood(DEFAULT);
+        eyes.anim_laugh();
         break;
       case 1:
-        eyes.setMood(HAPPY);
+        eyes.anim_confused();
         break;
       case 2:
-        eyes.setMood(ANGRY);
+        eyes.setCuriosity(true);
         break;
       case 3:
-        eyes.setMood(TIRED);
+        eyes.setIdleMode(true);
         break;
     }
     face_count = 0;
   }
+}
+
+void reset_face(){
+  eyes.setPosition(DEFAULT); 
+  eyes.setIdleMode(false);
+  eyes.setCuriosity(false);
 }
 
 void loop() {
@@ -244,7 +253,7 @@ void loop() {
     send_frame_base64((const uint8_t*)pcm16_buf, FRAME_BYTES_16);
   }
   ws.poll();
-  // change_face(count);
+  change_face(count);
   eyes.update();
   draw_text_overlay();
   loop_oled_idle();
