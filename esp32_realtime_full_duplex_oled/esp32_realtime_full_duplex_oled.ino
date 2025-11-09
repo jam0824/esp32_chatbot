@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <Wire.h>
 #include <ArduinoWebsockets.h>
+#include <ArduinoJson.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <FluxGarage_RoboEyes.h> //https://github.com/FluxGarage/RoboEyes
@@ -24,6 +25,12 @@ RoboEyes<Adafruit_SSD1306> eyes(display);
 int count = 0;
 static volatile bool is_speak_face = false;
 static uint32_t last_tts_ms = 0;
+
+String lastText;
+static uint32_t lastText_ms = 0;
+static const uint32_t TEXT_DISPLAY_MS = 7000;
+static bool textActive = false;
+static const int TEXT_AREA_Y = 48;
 
 // ===== WiFi / WS =====
 const char* WIFI_SSID = "TP-Link_C4D5";
@@ -104,9 +111,33 @@ void send_frame_base64(const uint8_t* pcm16, size_t len) {
   }
 }
 
+void show_text_on_oled(const String& text) {
+  lastText = text;
+  lastText_ms = millis();
+  textActive = true;
+}
+
+bool try_handle_text(const String& msg) {
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, msg);
+  if (err) return false;
+  const char* type = doc["type"] | "";
+  if (String(type) != "text") return false;
+  const char* message = doc["message"] | "";
+  lastText = String(message);
+  show_text_on_oled(lastText);
+  Serial.print("[TEXT] ");
+  Serial.println(lastText);
+  return true;
+}
+
 void onMessage(WebsocketsMessage msg) {
   if (!msg.isText()) return;
-  String b64 = msg.data();
+  String payload = msg.data();
+  if (try_handle_text(payload)) {
+    return;
+  }
+  String b64 = payload;
   if(!is_speak_face){
     is_speak_face = true;
     eyes.setMood(HAPPY);
@@ -143,6 +174,27 @@ void start_oled(){
   eyes.setDisplayColors(0, 1);
   eyes.setAutoblinker(true,3,1);
   eyes.setMood(DEFAULT);
+}
+
+void loop_oled_idle(){
+  if (textActive) {
+    if ((millis() - lastText_ms) > TEXT_DISPLAY_MS) {
+      textActive = false;
+      lastText = "";
+      display.clearDisplay();
+      eyes.update(); // redraw face without text
+    }
+  }
+}
+
+void draw_text_overlay(){
+  if (!textActive) return;
+  display.fillRect(0, TEXT_AREA_Y, SCREEN_WIDTH, SCREEN_HEIGHT - TEXT_AREA_Y, SSD1306_BLACK);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, TEXT_AREA_Y);
+  display.println(lastText);
+  display.display();
 }
 
 void setup() {
@@ -194,6 +246,8 @@ void loop() {
   ws.poll();
   // change_face(count);
   eyes.update();
+  draw_text_overlay();
+  loop_oled_idle();
   if (is_speak_face && (millis() - last_tts_ms) > 5000) {
     is_speak_face = false;
     eyes.setMood(DEFAULT);

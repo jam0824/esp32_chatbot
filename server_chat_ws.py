@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import PlainTextResponse
-import asyncio, base64, math, threading, queue, contextlib, time, os
+import asyncio, base64, math, threading, queue, contextlib, time, os, json
 from google.cloud import speech_v1 as speech
 from google.cloud import texttospeech
 from openai import OpenAI
@@ -258,6 +258,11 @@ async def ws_chat(ws: WebSocket):
         nonlocal last_trigger_ts
         try:
             reply   = await asyncio.to_thread(llm_reply_en, user_text)
+            # テキストもクライアントへ通知（JSON）
+            try:
+                await ws.send_text(json.dumps({"type": "text", "message": reply}))
+            except Exception as e:
+                print("[WS text send error]", e)
             pcm_tts = await asyncio.to_thread(synth_tts_16k_linear16, reply)
             if last_trigger_ts is not None:
                 tat = (time.time() - last_trigger_ts) * 1000.0
