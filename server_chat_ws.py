@@ -42,7 +42,7 @@ history = ""
 # ===== Utils =====
 def collect_final_results(worker_alive: bool, result_q: queue.Queue, pending: list[str]) -> bool:
     """STT結果キューから最終テキストをpendingへ追加し、追加があればTrue。"""
-    if not worker_alive:
+    if result_q is None:
         return False
     added = False
     while not result_q.empty():

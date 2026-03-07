@@ -33,9 +33,9 @@ static bool textActive = false;
 static const int TEXT_AREA_Y = 48;
 
 // ===== WiFi / WS =====
-const char* WIFI_SSID = "TP-Link_C4D5";
+const char* WIFI_SSID = "";
 const char* WIFI_PASS = "";
-const char* WS_URL    = "ws://192.168.1.151:8000/ws_chat";
+const char* WS_URL    = "ws://10.127.220.232:8000/ws_chat";
 
 // ===== Audio =====
 static const int SAMPLE_RATE     = 16000;
