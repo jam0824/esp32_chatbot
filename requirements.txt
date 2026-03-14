@@ -3,5 +3,5 @@ starlette
 uvicorn
 openai
 google-cloud-speech
-google-cloud-texttospeech
+google-cloud-texttospeech>=2.32.0
 webrtcvad

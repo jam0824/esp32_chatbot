@@ -29,9 +29,11 @@ VAD_STOP_SILENCE_MS = 400   # ms
 VAD_PREBUFFER_MS    = 200      # ms
 
 # STT/TTS
-LANG                = "en-US"
-DEFAULT_TTS_VOICE   = "en-US-Neural2-F"  # 例: en-US-Studio-O, en-US-Wavenet-D
-SYSTEM_PROMPT       = "Your name is Chapiko.You are a concise, friendly English voice assistant. User studies English. You are a teacher.Keep replies short and natural for TTS."
+LANG                = "ja-JP"
+DEFAULT_TTS_VOICE   = "Zephyr"
+TTS_MODEL_NAME      = "gemini-2.5-flash-tts"
+TTS_PROMPT          = "自然で親しみやすいトーンで読み上げてください"
+SYSTEM_PROMPT       = "あなたの名前はチャピコです。簡潔でフレンドリーな日本語の音声アシスタントです。返答は音声合成に適した短く自然な文にしてください。"
 
 app = FastAPI()
 speech_client = speech.SpeechClient()
@@ -86,16 +88,16 @@ def synth_tts_16k_linear16(text: str) -> bytes:
     audio_cfg = texttospeech.AudioConfig(
         audio_encoding=texttospeech.AudioEncoding.LINEAR16,
         sample_rate_hertz=SAMPLE_RATE,
-        speaking_rate=1.05,
-        pitch=-2.0,
-        volume_gain_db=10.0,
-        effects_profile_id=["small-bluetooth-speaker-class-device"],
     )
-    voice = texttospeech.VoiceSelectionParams(language_code=LANG, name=DEFAULT_TTS_VOICE)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code=LANG,
+        name=DEFAULT_TTS_VOICE,
+        model_name=TTS_MODEL_NAME,
+    )
     req = texttospeech.SynthesizeSpeechRequest(
-        input=texttospeech.SynthesisInput(text=text),
+        input=texttospeech.SynthesisInput(text=text, prompt=TTS_PROMPT),
         voice=voice,
-        audio_config=audio_cfg
+        audio_config=audio_cfg,
     )
     wav = tts_client.synthesize_speech(request=req).audio_content
     # WAVヘッダが来る環境もあるので簡易剥がし
@@ -107,7 +109,7 @@ def synth_tts_16k_linear16(text: str) -> bytes:
             i += csz + (csz & 1)
     return wav
 
-def llm_reply_en(user_text: str) -> str:
+def llm_reply(user_text: str) -> str:
     global history
     print(f"[LLM-REQ] {user_text}")
     history = history + "User: " + user_text + "\n"
@@ -185,7 +187,7 @@ async def send_pcm_frames(ws: WebSocket, pcm16: bytes):
 
 @app.get("/", response_class=PlainTextResponse)
 def hello():
-    return "Realtime voice chatbot WS server (en-US, WebRTC VAD-gated)."
+    return "Realtime voice chatbot WS server (ja-JP, Gemini-TTS, WebRTC VAD-gated)."
 
 # ===== Main WS =====
 @app.websocket("/ws_chat")
@@ -257,7 +259,7 @@ async def ws_chat(ws: WebSocket):
         nonlocal speaking
         nonlocal last_trigger_ts
         try:
-            reply   = await asyncio.to_thread(llm_reply_en, user_text)
+            reply   = await asyncio.to_thread(llm_reply, user_text)
             # テキストもクライアントへ通知（JSON）
             try:
                 await ws.send_text(json.dumps({"type": "text", "message": reply}))

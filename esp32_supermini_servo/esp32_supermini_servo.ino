@@ -23,8 +23,6 @@ using namespace websockets;
 #define OLED_ADDR     0x3C
 #define OLED_FPS 30
 constexpr int FACE_INTERVAL_FRAMES = 500;
-static const int TEXT_AREA_Y = 48;
-static const uint32_t TEXT_DISPLAY_MS = 7000;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 RoboEyes<Adafruit_SSD1306> eyes(display);
@@ -33,15 +31,11 @@ static int count = 0;
 static volatile bool is_speak_face = false;
 static uint32_t last_tts_ms = 0;
 
-static String lastText;
-static uint32_t lastText_ms = 0;
-static bool textActive = false;
-
 // =====================
 // WiFi / WS
 // =====================
-const char* WIFI_SSID = "";
-const char* WIFI_PASS = "";
+const char* WIFI_SSID = "TP-Link_C4D5";
+const char* WIFI_PASS = "75758141";
 const char* WS_URL    = "ws://192.168.1.151:8000/ws_chat"; // <-- change
 
 WebsocketsClient ws;
@@ -154,12 +148,6 @@ void reset_face(){
   eyes.setCuriosity(false);
 }
 
-void show_text_on_oled(const String& text) {
-  lastText = text;
-  lastText_ms = millis();
-  textActive = true;
-}
-
 bool try_handle_text(const String& msg) {
   StaticJsonDocument<512> doc;
   DeserializationError err = deserializeJson(doc, msg);
@@ -167,7 +155,6 @@ bool try_handle_text(const String& msg) {
   const char* type = doc["type"] | "";
   if (String(type) != "text") return false;
   const char* message = doc["message"] | "";
-  show_text_on_oled(String(message));
   Serial.print("[TEXT] ");
   Serial.println(message);
   return true;
@@ -186,25 +173,6 @@ void start_oled(){
   eyes.setDisplayColors(0, 1);
   eyes.setAutoblinker(true,3,1);
   eyes.setMood(DEFAULT);
-}
-
-void loop_oled_idle(){
-  if (textActive && (millis() - lastText_ms) > TEXT_DISPLAY_MS) {
-    textActive = false;
-    lastText = "";
-    display.clearDisplay();
-    eyes.update();
-  }
-}
-
-void draw_text_overlay(){
-  if (!textActive) return;
-  display.fillRect(0, TEXT_AREA_Y, SCREEN_WIDTH, SCREEN_HEIGHT - TEXT_AREA_Y, SSD1306_BLACK);
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, TEXT_AREA_Y);
-  display.println(lastText);
-  display.display();
 }
 
 void change_face(int& face_count){
@@ -448,6 +416,4 @@ void loop() {
   }
 
   eyes.update();
-  draw_text_overlay();
-  loop_oled_idle();
 }
