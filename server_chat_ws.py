@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import PlainTextResponse
-import asyncio, base64, math, threading, queue, contextlib, time, os, json
+import asyncio, base64, math, threading, queue, contextlib, time, os, json, re
 from google.cloud import speech_v1 as speech
 from google.cloud import texttospeech
 from openai import OpenAI
@@ -255,7 +255,7 @@ async def ws_chat(ws: WebSocket):
     last_trigger_ts = None
 
     async def build_and_speak(user_text: str):
-        """LLM→TTS→送出（非ブロッキング）。送出が終わったら次ターンのためにSTTを張り直す。"""
+        """LLM→文分割TTS→送出（非ブロッキング）。送出が終わったら次ターンのためにSTTを張り直す。"""
         nonlocal speaking
         nonlocal last_trigger_ts
         try:
@@ -265,13 +265,23 @@ async def ws_chat(ws: WebSocket):
                 await ws.send_text(json.dumps({"type": "text", "message": reply}))
             except Exception as e:
                 print("[WS text send error]", e)
-            pcm_tts = await asyncio.to_thread(synth_tts_16k_linear16, reply)
-            if last_trigger_ts is not None:
-                tat = (time.time() - last_trigger_ts) * 1000.0
-                print(f"[TAT] first-audio {tat:.1f} ms (google)")
-            print(f"[TTS] start, bytes={len(pcm_tts)} (~{len(pcm_tts)/FRAME_BYTES*20:.0f}ms)")
-            await send_pcm_frames(ws, pcm_tts)
-            print("[TTS] done")
+
+            # 文単位で分割して逐次 TTS → 送信（TTFA 短縮）
+            list_sentences = [s for s in re.split(r'(?<=[。！？!?])', reply) if s.strip()]
+            if not list_sentences:
+                list_sentences = [reply]
+
+            print(f"[TTS] split into {len(list_sentences)} sentence(s)")
+            first_sent = True
+            for idx, sentence in enumerate(list_sentences):
+                pcm_tts = await asyncio.to_thread(synth_tts_16k_linear16, sentence)
+                if first_sent and last_trigger_ts is not None:
+                    tat = (time.time() - last_trigger_ts) * 1000.0
+                    print(f"[TAT] first-audio {tat:.1f} ms (gemini-tts)")
+                    first_sent = False
+                print(f"[TTS] sent [{idx+1}/{len(list_sentences)}] \"{sentence}\" bytes={len(pcm_tts)} (~{len(pcm_tts)/FRAME_BYTES*20:.0f}ms)")
+                await send_pcm_frames(ws, pcm_tts)
+            print("[TTS] done (all sentences)")
         except Exception as e:
             print("[PIPE error]", e)
         finally:
