@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import PlainTextResponse
-import asyncio, base64, math, threading, queue, contextlib, time, os, json
+import asyncio, base64, math, threading, queue, contextlib, time, os, json, re
 from google.cloud import speech_v1 as speech
 from google.cloud import texttospeech
 from openai import OpenAI
@@ -29,9 +29,11 @@ VAD_STOP_SILENCE_MS = 400   # ms
 VAD_PREBUFFER_MS    = 200      # ms
 
 # STT/TTS
-LANG                = "en-US"
-DEFAULT_TTS_VOICE   = "en-US-Neural2-F"  # 例: en-US-Studio-O, en-US-Wavenet-D
-SYSTEM_PROMPT       = "Your name is Chapiko.You are a concise, friendly English voice assistant. User studies English. You are a teacher.Keep replies short and natural for TTS."
+LANG                = "ja-JP"
+DEFAULT_TTS_VOICE   = "Zephyr"
+TTS_MODEL_NAME      = "gemini-2.5-flash-tts"
+TTS_PROMPT          = "自然で親しみやすいトーンで読み上げてください"
+SYSTEM_PROMPT       = "あなたの名前はチャピコです。簡潔でフレンドリーな日本語の音声アシスタントです。返答は音声合成に適した短く自然な文にしてください。"
 
 app = FastAPI()
 speech_client = speech.SpeechClient()
@@ -86,16 +88,16 @@ def synth_tts_16k_linear16(text: str) -> bytes:
     audio_cfg = texttospeech.AudioConfig(
         audio_encoding=texttospeech.AudioEncoding.LINEAR16,
         sample_rate_hertz=SAMPLE_RATE,
-        speaking_rate=1.05,
-        pitch=-2.0,
-        volume_gain_db=10.0,
-        effects_profile_id=["small-bluetooth-speaker-class-device"],
     )
-    voice = texttospeech.VoiceSelectionParams(language_code=LANG, name=DEFAULT_TTS_VOICE)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code=LANG,
+        name=DEFAULT_TTS_VOICE,
+        model_name=TTS_MODEL_NAME,
+    )
     req = texttospeech.SynthesizeSpeechRequest(
-        input=texttospeech.SynthesisInput(text=text),
+        input=texttospeech.SynthesisInput(text=text, prompt=TTS_PROMPT),
         voice=voice,
-        audio_config=audio_cfg
+        audio_config=audio_cfg,
     )
     wav = tts_client.synthesize_speech(request=req).audio_content
     # WAVヘッダが来る環境もあるので簡易剥がし
@@ -107,7 +109,7 @@ def synth_tts_16k_linear16(text: str) -> bytes:
             i += csz + (csz & 1)
     return wav
 
-def llm_reply_en(user_text: str) -> str:
+def llm_reply(user_text: str) -> str:
     global history
     print(f"[LLM-REQ] {user_text}")
     history = history + "User: " + user_text + "\n"
@@ -185,7 +187,7 @@ async def send_pcm_frames(ws: WebSocket, pcm16: bytes):
 
 @app.get("/", response_class=PlainTextResponse)
 def hello():
-    return "Realtime voice chatbot WS server (en-US, WebRTC VAD-gated)."
+    return "Realtime voice chatbot WS server (ja-JP, Gemini-TTS, WebRTC VAD-gated)."
 
 # ===== Main WS =====
 @app.websocket("/ws_chat")
@@ -253,23 +255,33 @@ async def ws_chat(ws: WebSocket):
     last_trigger_ts = None
 
     async def build_and_speak(user_text: str):
-        """LLM→TTS→送出（非ブロッキング）。送出が終わったら次ターンのためにSTTを張り直す。"""
+        """LLM→文分割TTS→送出（非ブロッキング）。送出が終わったら次ターンのためにSTTを張り直す。"""
         nonlocal speaking
         nonlocal last_trigger_ts
         try:
-            reply   = await asyncio.to_thread(llm_reply_en, user_text)
+            reply   = await asyncio.to_thread(llm_reply, user_text)
             # テキストもクライアントへ通知（JSON）
             try:
                 await ws.send_text(json.dumps({"type": "text", "message": reply}))
             except Exception as e:
                 print("[WS text send error]", e)
-            pcm_tts = await asyncio.to_thread(synth_tts_16k_linear16, reply)
-            if last_trigger_ts is not None:
-                tat = (time.time() - last_trigger_ts) * 1000.0
-                print(f"[TAT] first-audio {tat:.1f} ms (google)")
-            print(f"[TTS] start, bytes={len(pcm_tts)} (~{len(pcm_tts)/FRAME_BYTES*20:.0f}ms)")
-            await send_pcm_frames(ws, pcm_tts)
-            print("[TTS] done")
+
+            # 文単位で分割して逐次 TTS → 送信（TTFA 短縮）
+            list_sentences = [s for s in re.split(r'(?<=[。！？!?])', reply) if s.strip()]
+            if not list_sentences:
+                list_sentences = [reply]
+
+            print(f"[TTS] split into {len(list_sentences)} sentence(s)")
+            first_sent = True
+            for idx, sentence in enumerate(list_sentences):
+                pcm_tts = await asyncio.to_thread(synth_tts_16k_linear16, sentence)
+                if first_sent and last_trigger_ts is not None:
+                    tat = (time.time() - last_trigger_ts) * 1000.0
+                    print(f"[TAT] first-audio {tat:.1f} ms (gemini-tts)")
+                    first_sent = False
+                print(f"[TTS] sent [{idx+1}/{len(list_sentences)}] \"{sentence}\" bytes={len(pcm_tts)} (~{len(pcm_tts)/FRAME_BYTES*20:.0f}ms)")
+                await send_pcm_frames(ws, pcm_tts)
+            print("[TTS] done (all sentences)")
         except Exception as e:
             print("[PIPE error]", e)
         finally:
