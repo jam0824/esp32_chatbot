@@ -35,7 +35,7 @@ static uint32_t last_tts_ms = 0;
 // WiFi / WS
 // =====================
 const char* WIFI_SSID = "TP-Link_C4D5";
-const char* WIFI_PASS = "75758141";
+const char* WIFI_PASS = "";
 const char* WS_URL    = "ws://192.168.1.151:8000/ws_chat"; // <-- change
 
 WebsocketsClient ws;
