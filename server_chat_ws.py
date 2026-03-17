@@ -31,9 +31,9 @@ VAD_PREBUFFER_MS    = 200      # ms
 # STT/TTS
 LANG                = "ja-JP"
 DEFAULT_TTS_VOICE   = "Zephyr"
-TTS_MODEL_NAME      = "gemini-2.5-flash-tts"
+TTS_MODEL_NAME      = "gemini-2.5-flash-lite-preview-tts"
 TTS_PROMPT          = "自然で親しみやすいトーンで読み上げてください"
-SYSTEM_PROMPT       = "あなたの名前はチャピコです。簡潔でフレンドリーな日本語の音声アシスタントです。返答は音声合成に適した短く自然な文にしてください。"
+SYSTEM_PROMPT       = "あなたの名前はチャピコです。簡潔でフレンドリーな日本語の音声アシスタントです。返答は音声合成に適した短く自然な文にしてください。50文字以内です。"
 
 app = FastAPI()
 speech_client = speech.SpeechClient()
@@ -88,6 +88,7 @@ def synth_tts_16k_linear16(text: str) -> bytes:
     audio_cfg = texttospeech.AudioConfig(
         audio_encoding=texttospeech.AudioEncoding.LINEAR16,
         sample_rate_hertz=SAMPLE_RATE,
+        volume_gain_db=15.0,
     )
     voice = texttospeech.VoiceSelectionParams(
         language_code=LANG,
@@ -114,19 +115,26 @@ def llm_reply(user_text: str) -> str:
     print(f"[LLM-REQ] {user_text}")
     history = history + "User: " + user_text + "\n"
     system_content = SYSTEM_PROMPT + " chat history: " + history
-    r = oa.responses.create(
-        model="gpt-4.1-nano",
-        input=[
-            {"role":"system","content":system_content},
-            {"role":"user","content":user_text}
-        ],
-        max_output_tokens=120
-    )
     try:
+        r = oa.responses.create(
+            model="gpt-5-nano",
+            instructions=system_content,
+            input=[
+                {"role":"user","content":user_text}
+            ],
+            max_output_tokens=1024,
+            reasoning={"effort": "low"},
+        )
+        print(f"[LLM-RAW] status={r.status}  output={r.output}")
         out = r.output_text.strip()
-    except Exception:
-        out = r.output[0].content[0].text.strip()
-    print(f"[LLM-RES] {out}")
+    except Exception as e:
+        print(f"[LLM-ERR] {type(e).__name__}: {e}")
+        out = ""
+    if not out:
+        out = "すみません、うまく答えられませんでした。"
+        print("[LLM-RES] (empty response, using fallback)")
+    else:
+        print(f"[LLM-RES] {out}")
     history = history + "Assistant: " + out + "\n"
     print(f"[LLM-HIST] {history}")
     return out
@@ -265,6 +273,11 @@ async def ws_chat(ws: WebSocket):
                 await ws.send_text(json.dumps({"type": "text", "message": reply}))
             except Exception as e:
                 print("[WS text send error]", e)
+
+            # 空レスポンスならTTSスキップ
+            if not reply or not reply.strip():
+                print("[TTS] skipped (empty reply)")
+                return
 
             # 文単位で分割して逐次 TTS → 送信（TTFA 短縮）
             list_sentences = [s for s in re.split(r'(?<=[。！？!?])', reply) if s.strip()]
