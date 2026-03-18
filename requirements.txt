@@ -5,3 +5,4 @@ openai
 google-cloud-speech
 google-cloud-texttospeech>=2.32.0
 webrtcvad
+setuptools<81
