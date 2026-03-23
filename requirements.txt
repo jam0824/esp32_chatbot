@@ -3,6 +3,7 @@ starlette
 uvicorn
 openai
 google-cloud-speech
-google-cloud-texttospeech>=2.32.0
+httpx
+python-dotenv
 webrtcvad
 setuptools<81
