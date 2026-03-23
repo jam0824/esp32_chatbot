@@ -33,7 +33,7 @@ VAD_PREBUFFER_MS    = 200      # ms
 
 # STT / TTS（ElevenLabs は synth_tts_16k_linear16 内で環境変数参照）
 LANG          = "ja-JP"
-SYSTEM_PROMPT = "あなたの名前はチャピコです。簡潔でフレンドリーな日本語の音声アシスタントです。返答は音声合成に適した短く自然な文にしてください。50文字以内です。"
+SYSTEM_PROMPT = "あなたの名前はチャピコです。簡潔でフレンドリーな日本語の音声アシスタントです。返答は音声合成に適した短く自然な文にしてください。50文字以内です。語尾は偽中国人っぽく「アルヨ」「アルネ」です。"
 
 app = FastAPI()
 speech_client = speech.SpeechClient()
@@ -117,6 +117,7 @@ def synth_tts_16k_linear16(text: str) -> bytes:
     ja_norm = (os.environ.get("ELEVENLABS_APPLY_JA_LANG_NORM") or "").strip().lower()
     if ja_norm in ("1", "true", "yes", "on"):
         body["apply_language_text_normalization"] = True
+        body["language_code"] = "ja"
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
