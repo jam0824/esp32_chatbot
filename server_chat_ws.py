@@ -2,11 +2,14 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import PlainTextResponse
 import asyncio, base64, math, threading, queue, contextlib, time, os, json, re
 from google.cloud import speech_v1 as speech
-from google.cloud import texttospeech
 from openai import OpenAI
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 import webrtcvad
 from collections import deque
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ===== Config =====
 SAMPLE_RATE   = 16000
@@ -28,16 +31,12 @@ VAD_STOP_SILENCE_MS = 400   # ms
 # 発話の頭切れ防止のため、STT開始時に過去フレームを先送りするプリロール
 VAD_PREBUFFER_MS    = 200      # ms
 
-# STT/TTS
-LANG                = "ja-JP"
-DEFAULT_TTS_VOICE   = "Zephyr"
-TTS_MODEL_NAME      = "gemini-2.5-flash-lite-preview-tts"
-TTS_PROMPT          = "自然で親しみやすいトーンで読み上げてください"
-SYSTEM_PROMPT       = "あなたの名前はチャピコです。簡潔でフレンドリーな日本語の音声アシスタントです。返答は音声合成に適した短く自然な文にしてください。50文字以内です。"
+# STT / TTS（ElevenLabs は synth_tts_16k_linear16 内で環境変数参照）
+LANG          = "ja-JP"
+SYSTEM_PROMPT = "あなたの名前はチャピコです。簡潔でフレンドリーな日本語の音声アシスタントです。返答は音声合成に適した短く自然な文にしてください。50文字以内です。語尾は偽中国人っぽく「アルヨ」「アルネ」です。"
 
 app = FastAPI()
 speech_client = speech.SpeechClient()
-tts_client    = texttospeech.TextToSpeechClient()
 oa            = OpenAI()  # OPENAI_API_KEY を環境変数に
 history = ""
 
@@ -84,31 +83,58 @@ def rms_int16(pcm: bytes) -> float:
     s = sum(x*x for x in a)
     return math.sqrt(s/len(a))
 
-def synth_tts_16k_linear16(text: str) -> bytes:
-    audio_cfg = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-        sample_rate_hertz=SAMPLE_RATE,
-        volume_gain_db=15.0,
-    )
-    voice = texttospeech.VoiceSelectionParams(
-        language_code=LANG,
-        name=DEFAULT_TTS_VOICE,
-        model_name=TTS_MODEL_NAME,
-    )
-    req = texttospeech.SynthesizeSpeechRequest(
-        input=texttospeech.SynthesisInput(text=text, prompt=TTS_PROMPT),
-        voice=voice,
-        audio_config=audio_cfg,
-    )
-    wav = tts_client.synthesize_speech(request=req).audio_content
-    # WAVヘッダが来る環境もあるので簡易剥がし
-    if len(wav) >= 12 and wav[:4]==b'RIFF' and wav[8:12]==b'WAVE':
+def _pcm_from_maybe_wav(wav: bytes) -> bytes:
+    """WAV ラップ時は data チャンクだけ返す（生 PCM のときはそのまま）。"""
+    if len(wav) >= 12 and wav[:4] == b"RIFF" and wav[8:12] == b"WAVE":
         i = 12
-        while i+8 <= len(wav):
-            cid = wav[i:i+4]; csz = int.from_bytes(wav[i+4:i+8],'little'); i += 8
-            if cid == b'data': return wav[i:i+csz]
+        while i + 8 <= len(wav):
+            cid = wav[i : i + 4]
+            csz = int.from_bytes(wav[i + 4 : i + 8], "little")
+            i += 8
+            if cid == b"data":
+                return wav[i : i + csz]
             i += csz + (csz & 1)
     return wav
+
+
+def synth_tts_16k_linear16(text: str) -> bytes:
+    """ElevenLabs TTS → 16kHz LINEAR16 生 PCM（output_format=pcm_16000）。"""
+    api_key = (os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+    voice_id = (os.environ.get("ELEVENLABS_VOICE_ID") or "").strip()
+    if not api_key or not voice_id:
+        raise RuntimeError("ELEVENLABS_API_KEY と ELEVENLABS_VOICE_ID を .env などで設定してください")
+
+    model_id = (os.environ.get("ELEVENLABS_MODEL_ID") or "eleven_multilingual_v2").strip()
+    params: dict[str, str | int] = {"output_format": "pcm_16000"}
+    lat = (os.environ.get("ELEVENLABS_OPTIMIZE_STREAMING_LATENCY") or "").strip()
+    if lat:
+        try:
+            params["optimize_streaming_latency"] = int(lat)
+        except ValueError:
+            pass
+
+    body: dict = {"text": text, "model_id": model_id}
+    ja_norm = (os.environ.get("ELEVENLABS_APPLY_JA_LANG_NORM") or "").strip().lower()
+    if ja_norm in ("1", "true", "yes", "on"):
+        body["apply_language_text_normalization"] = True
+        body["language_code"] = "ja"
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
+    with httpx.Client(timeout=60.0) as client:
+        r = client.post(url, params=params, json=body, headers=headers)
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                detail = e.response.text[:500]
+            except Exception:
+                pass
+            raise RuntimeError(f"ElevenLabs TTS HTTP {e.response.status_code}: {detail}") from e
+        raw = r.content
+
+    return _pcm_from_maybe_wav(raw)
 
 def llm_reply(user_text: str) -> str:
     global history
@@ -195,7 +221,7 @@ async def send_pcm_frames(ws: WebSocket, pcm16: bytes):
 
 @app.get("/", response_class=PlainTextResponse)
 def hello():
-    return "Realtime voice chatbot WS server (ja-JP, Gemini-TTS, WebRTC VAD-gated)."
+    return "Realtime voice chatbot WS server (ja-JP, ElevenLabs TTS, WebRTC VAD-gated)."
 
 # ===== Main WS =====
 @app.websocket("/ws_chat")
@@ -290,7 +316,7 @@ async def ws_chat(ws: WebSocket):
                 pcm_tts = await asyncio.to_thread(synth_tts_16k_linear16, sentence)
                 if first_sent and last_trigger_ts is not None:
                     tat = (time.time() - last_trigger_ts) * 1000.0
-                    print(f"[TAT] first-audio {tat:.1f} ms (gemini-tts)")
+                    print(f"[TAT] first-audio {tat:.1f} ms (elevenlabs-tts)")
                     first_sent = False
                 print(f"[TTS] sent [{idx+1}/{len(list_sentences)}] \"{sentence}\" bytes={len(pcm_tts)} (~{len(pcm_tts)/FRAME_BYTES*20:.0f}ms)")
                 await send_pcm_frames(ws, pcm_tts)
